@@ -1,0 +1,259 @@
+---
+title: "Car accidents per hexagon"
+output: html_notebook
+---
+
+Attempting to follow this: https://docs.ropensci.org/stats19/articles/stats19.html
+
+Setup:
+
+```{r setup}
+library(tidyverse)
+library(stats19)
+library(sp)
+library(sf)
+library(tmap)
+library(pct)      # access travel data from DfT-funded PCT project 
+library(stats19)  # get stats19 data
+library(stplanr)  # transport planning tools
+library(osmdata)
+library(ggspatial)
+library(raster)
+library(rgeos)
+library(rgbif)
+library(viridis)
+library(gridExtra)
+library(rasterVis)
+setwd("C:/Users/brown/Desktop/stats19_database/r_stats19")
+```
+
+Get some data:
+
+```{r fig.width = 10, fig.height=10}
+# Get stats19
+a19p <- "dftRoadSafetyData_Accidents_2019"
+
+## dl_stats19(file_name = paste0(a19p, ".zip"),
+##           year = 2019,
+##           type = "accidents",
+##           data_dir = "C:/Users/brown/Desktop/stats19_database/r_stats19",
+##           ask = TRUE)
+
+incidents_2019 <- read_accidents(
+  filename = "C:/Users/brown/Desktop/stats19_database/r_stats19/data/2019/DfTRoadSafety_Accidents_2019/accidents_2019.csv",
+  data_dir = "C:/Users/brown/Desktop/stats19_database/r_stats19/data/2019",
+  year = 2019)
+
+incidents_2019 <- format_sf(incidents_2019)
+
+# Get LA boundaries
+## https://geoportal.statistics.gov.uk/datasets/local-authority-districts-december-2019-boundaries-uk-bgc
+la_boundaries <- st_read("C:/Users/brown/Desktop/basic_spatial_data/Local_Authority_Districts__December_2019__Boundaries_UK_BGC.shp")
+
+map_boundaries <- la_boundaries %>%
+  filter(str_detect(lad19cd, "^E09"))
+
+bb <- map_boundaries %>%
+  st_transform(crs = 4326) %>%
+  st_bbox()
+
+greater_london_boundary <- map_boundaries %>%
+  summarise(id = "greater_london")
+
+# Get roads
+query <- bb %>%
+  opq() %>%
+  add_osm_feature(key = "highway",
+                  value = c("motorway", "trunk", "primary"))
+
+roads <- osmdata_sf(query)
+
+roads <- roads$osm_lines
+
+roads <- roads %>%
+  dplyr::select(name)
+
+roads_cut <- roads %>%
+  st_transform(27700) %>%
+  st_intersection(greater_london_boundary)
+
+# Get place names
+query <- bb %>%
+         opq() %>%
+         add_osm_feature(key = "place",
+                         value = "city")
+
+places <- osmdata_sf(query) 
+
+places_sample <- places %>% head(10)
+
+places <- places$osm_points %>%
+  st_transform(27700)
+
+places$osm_points
+
+# Get train stations for context
+query <- bb %>%
+  opq() %>%
+  add_osm_feature(key = "railway",
+                  value = "station")
+
+rail_stations <- osmdata_sf(query)
+
+names_of_places <- rail_stations$osm_points %>%
+  st_transform(27700) %>%
+  filter(railway == "station",
+         !is.na(ref.crs)) %>%
+  st_intersection(map_boundaries) %>%
+  filter(str_detect(string = name,
+                    pattern = "Heathrow Terminals 2 & 3|Charing Cross|Green Lanes|Upminster|Wembley Stadium|Whitechapel|Catford Bridge|Sutton Common|Lewisham|Finchley|West Croydon")) %>%
+  dplyr::select(name) %>%
+  mutate(name = case_when(str_detect(name, "Charing") ~ name,
+                          str_detect(name, "Croydon") ~ word(name, 2),
+                          TRUE ~ word(name, 1)))
+
+# Subset incidents within boundaries
+map_incidents <- incidents_2019 %>%
+  st_filter(map_boundaries, .predicate = st_within)
+```
+
+Basic ggplot:
+
+```{r}
+ggplot(incidents_2019, aes(longitude, latitude)) + 
+  stat_binhex() +
+  scale_fill_gradient(colours = c("white","red"), name = "Frequency")
+
+ggplot(southampton_incidents, aes(longitude, latitude)) +
+  stat_binhex(bins = 60) +
+  scale_fill_gradient(colours = c("white","red"), name = "Frequency")
+```
+
+A better option might be to create a grid as an object, that I can assign attributes to. Function from: 
+
+```{r}
+make_grid <- function(x, cell_diameter, cell_area, clip = FALSE) {
+  if (missing(cell_diameter)) {
+    if (missing(cell_area)) {
+      stop("Must provide cell_diameter or cell_area")
+    } else {
+      cell_diameter <- sqrt(2 * cell_area / sqrt(3))
+    }
+  }
+  ext <- as(extent(x) + cell_diameter, "SpatialPolygons")
+  projection(ext) <- projection(x)
+  # generate array of hexagon centers
+  g <- spsample(ext, type = "hexagonal", cellsize = cell_diameter, 
+                offset = c(0.5, 0.5))
+  # convert center points to hexagons
+  g <- HexPoints2SpatialPolygons(g, dx = cell_diameter)
+  # clip to boundary of study area
+  if (clip) {
+    g <- gIntersection(g, x, byid = TRUE)
+  } else {
+    g <- g[x, ]
+  }
+  # clean up feature IDs
+  row.names(g) <- as.character(1:length(g))
+  return(g)
+}
+```
+
+Convert London to sp object:
+
+```{r fig.width = 10, fig.height=10}
+sp <- as_Spatial(greater_london_boundary)
+
+hex_grid <- make_grid(sp,
+                      cell_diameter = 500,
+                      clip = TRUE) %>%
+                      st_as_sf() %>%
+                      st_transform(crs = 27700) %>%
+                      mutate(hex_id = row_number())
+
+incidents_w_hex <- st_join(map_incidents, hex_grid, join = st_within)
+
+incidents_per_hex <- incidents_w_hex %>%
+  st_drop_geometry() %>%
+  group_by(hex_id) %>%
+  tally(n = "incident_count")
+
+grid_w_incidents <- hex_grid %>%
+  left_join(incidents_per_hex, by = "hex_id") %>%
+  replace_na(list(incident_count = 0))
+
+incidents_per_hex %>%
+  arrange(desc(incident_count))
+
+breaks <- c(0, 1, 2, 4, 8, 16, 32, 53)
+
+labels <- c("0", "1", "2 to 3", "4 to 7", "8 to 15", "16 to 31", "32 to 53")
+
+palette <- tmaptools::get_brewer_pal("Blues", n = 9, plot = FALSE)
+
+palette[1:3] <- "#FFFFFF"
+
+palette <- palette[3:9]
+
+tmap_mode("view")
+map <- tm_shape(roads_cut) +
+   tm_lines(alpha = 1,
+           col   = "black",
+           lwd   = 1) +
+ tm_shape(grid_w_incidents) +
+  tm_polygons(col     = "incident_count",
+              palette = palette,
+              breaks  = breaks,
+              labels  = labels,
+              title   = "Incidents within\neach hexagon",
+              alpha   = 0.7) +
+tm_shape(names_of_places) +
+  tm_symbols(shape       = "name",
+             shapes      = c(1:nrow(names_of_places)),
+             col         = "red",
+             border.lwd  = 2,
+             title.shape = "Localities, for context") +
+tm_add_legend(type   = "line",
+              col    = "black",
+              lwd    = 1,
+              labels = "Major road network",
+              title  = "") +
+  tm_credits("By Christoper C Brown\n(@ChrisB_Key)\nData processed using tidyverse.\nMap created using tmap(), sf() and\na hexagons function from\n@StrimasMackey.\nRoad traffic incidents from DfT\nSTATS19 database and accessed\nusing stats19() package.\nRoads and points of localities from\nOpen Street Map and accessed\nusing osmdata() package.\nCode at github.com/ccb2n19",
+             position = c("left", "bottom"),
+             size = 0.9) +
+tm_layout(legend.outside = TRUE,
+          frame          = FALSE,
+          # legend.position = c("right", "bottom"),
+          main.title     = "Road traffic incidents in\nLondon during 2019",
+          bg.color       = "grey95",
+          main.title.size = 3,
+          legend.title.size = 1.8,
+          legend.text.size = 0.9)
+
+map
+
+tmap_save(map,
+          "C:/Users/brown/Desktop/stats19_database/r_stats19/london_map.png",
+          width  = 50,
+          units  = "cm")
+
+# tmaptools::palette_explorer()
+```
+
+Check sums:
+
+```{r}
+sum(grid_w_incidents$incident_count) - nrow(southampton_incidents)
+```
+
+:) Total incidents within the grid is the same as the total incidents before computing the count per hexagon.
+
+Inspect roads:
+
+```{r}
+road_sample <- southampton_roads %>%
+  head(100)
+
+main_roads <- southampton_roads %>%
+  filter(highway %in% c("motorway", "trunk", "primary", "secondary", "tertiary"))
+```
