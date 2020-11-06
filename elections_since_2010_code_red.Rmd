@@ -1,0 +1,110 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Setup:
+
+```{r setup}
+library(tidyverse)
+library(sf)
+library(tmap)
+library(parlitools)
+library(geojsonio)
+setwd("C:/Users/brown/Desktop/election_data")
+```
+
+Get data:
+
+```{r}
+# Election data
+names(bes_2015)
+
+
+
+results_10_to_19 <- bes_2019 %>%
+  select(ons_const_id, constituency_name, winner_19, lab_19) %>%
+  left_join(bes_2017 %>% select(ons_const_id, winner_17, lab_17), by = "ons_const_id") %>%
+  left_join(bes_2015 %>% select(ons_const_id, winner_15, lab_15), by = "ons_const_id") %>%
+  left_join(bes_2015 %>% select(ons_const_id, winner_10, lab_10), by = "ons_const_id") %>%
+  mutate_if(is.factor, as.character) %>%
+  mutate(lab_share_change_17_19 = round(((lab_19 - lab_17) / lab_17) * 100, 1),
+         lab_share_change_15_17 = round(((lab_17 - lab_15) / lab_15) * 100, 1),
+         lab_share_change_10_15 = round(((lab_15 - lab_10) / lab_10) * 100, 1),
+         swing_status_17_19        = case_when(winner_19 == winner_17 ~ paste0(winner_19, " hold"),
+                                                              TRUE ~ paste0(winner_17, " to ", winner_19)),
+         swing_status_15_17        = case_when(winner_17 == winner_15 ~ paste0(winner_17, " hold"),
+                                                              TRUE ~ paste0(winner_15, " to ", winner_17)),
+         swing_status_10_15        = case_when(winner_15 == winner_10 ~ paste0(winner_15, " hold"),
+                                                              TRUE ~ paste0(winner_10, " to ", winner_15)))
+long_change <- results_10_to_19 %>%
+  pivot_longer(cols      = contains("lab_share_change"),
+               names_to  = "period",
+               values_to = "lab_share_change") %>%
+  mutate(period = str_extract(period, "[:digit:][:digit:]_[:digit:][:digit:]")) %>%
+  select(ons_const_id, period, lab_share_change)
+
+long_swing <- results_10_to_19 %>%
+  pivot_longer(cols      = contains("swing_status"),
+               names_to  = "period",
+               values_to = "swing_status") %>%
+  mutate(period = str_extract(period, "[:digit:][:digit:]_[:digit:][:digit:]")) %>%
+  select(ons_const_id, period, swing_status)
+
+all_long <- long_change %>%
+  left_join(long_swing, by = c("ons_const_id", "period")) %>%
+  rename(pcon19cd = "ons_const_id") %>%
+  separate(period, sep = "_", into = c("from", "to")) %>%
+  mutate(period = paste0("20", from, " to ", "20", to))
+
+# Boundaries
+cons_bounds <- geojson_read("https://opendata.arcgis.com/datasets/937997590f724a398ccc0100dbd9feee_0.geojson", what = "sp") %>%
+  st_as_sf() %>%
+  st_transform(crs = 27700) %>%
+  st_simplify(dTolerance = 1000)
+
+# Create spatial object with all of the data
+
+spatial_data <- cons_bounds %>%
+  left_join(all_long, by = "pcon19cd")
+```
+
+Plot:
+
+```{r fig.width = 14}
+tmap_mode("plot")
+map <- tm_shape(spatial_data) +
+  tm_polygons(col = "lab_share_change",
+              palette = "Spectral",
+              border.col = "grey98",
+              title = "Change in Labour\nvote share (%)",
+              n = 15) +
+tm_facets(by = "period",
+          nrow = 1,
+          ncol = 1) +
+tm_credits("By Christopher C Brown\n(@chrisb_key)\nData from British Election Study\naccessed ever so easily\nusing parlitools() package.\nConstituency boundaries\nfrom Open Geography Portal.\nCode available at\ngithub.com/ccb2n19",
+           position = c("left", "bottom"),
+           size = 1.5)+
+tm_layout(bg.color = "grey98",
+          panel.label.bg.color = "grey98",
+          frame = FALSE,
+          main.title.fontface = "bold",
+          panel.label.fontface = "bold",          
+          legend.title.fontface = "bold",
+          main.title.size = 2.5,
+          panel.label.size = 2.5,
+          legend.title.size = 2,
+          legend.text.size = 1.5,
+          main.title = "Change in Labour vote share between recent\nUK parliamentary elections",
+          legend.show = TRUE,
+          legend.position = c("right", "top"))
+
+map
+
+tmap_animation(tm       = map, 
+               filename = "elections_since_2010.gif",
+               width    = 1500,
+               height   = 1800,
+               delay    = 200)
+```
+
