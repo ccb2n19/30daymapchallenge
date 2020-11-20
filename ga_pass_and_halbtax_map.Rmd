@@ -15,6 +15,7 @@ library(pxR)
 library(rjson)
 library(rgdal)
 library(maps)
+library(rmapshaper)
 setwd("C:/Users/brown/Desktop/swiss_data_maps")
 ```
 
@@ -25,7 +26,13 @@ ga_halb_orig <- read_xlsx("ga_and_halbtax/data.xlsx")
 plzo_plz_name <- st_read("spatial/postcodes/PLZO_PLZ.shp")
 pop_orig <- read.px("population/population.px")
 pop_norm <- read_xlsx("population/population.xlsx", sheet = 1, skip = 2)
-
+postcode_lookup_orig <- read_tsv("postcode_lookup/data.txt",
+                            col_names = FALSE)
+lookup_colnames <- read_tsv("postcode_lookup/readme.txt",
+                            col_names = FALSE) %>%
+  filter(str_detect(X1, "[:space:][:space:][:space:][:space:][:punct:]")) %>%
+  separate(X1, sep = "\\:", into = c("name", "desc")) %>%
+  pull(name)
 
 sw_gbd <- "spatial/ArcGIS_D/ArcGIS_D/Schienennetz_LV03_20171210.gdb"
 subset(ogrDrivers(), grepl("GDB", name))
@@ -39,10 +46,36 @@ swiss_network <- readOGR(dsn=sw_gbd,layer="Netzsegment") %>%
 Simplify the boundary data ...
 
 ```{r fig.height = 10, fig.width=15}
-simp_swiss <- st_simplify(plzo_plz_name, dTolerance = 30, preserveTopology = TRUE) %>%
+simp_swiss <- plzo_plz_name %>%
   select(PLZ) %>%
+  rmapshaper::ms_simplify(keep = 0.05) %>% 
   mutate(PLZ = as.numeric(PLZ))
 ```
+
+Simplify the railways data:
+
+```{r}
+rail_simp <- swiss_network %>%
+# filter(AnzahlStreckengleise > 1) %>%
+  select() %>%
+  rmapshaper::ms_simplify(keep = 0.05)
+
+tmap_mode("view")
+tm_shape(rail_simp) +
+  tm_lines()
+```
+
+Processs postcode data:
+
+```{r}
+names(postcode_lookup_orig) <- lookup_colnames
+
+postcode_lookup <- postcode_lookup_orig %>%
+  select(PLZ = 2,
+         place_name = 3,
+         kanton = 4)
+```
+
 
 Process the halbtax data:
 
@@ -103,17 +136,59 @@ subset <- ga_halb %>%
 swiss_2019 <- simp_swiss %>%
   left_join(subset, by = "PLZ") %>%
   left_join(pop_new_norm, by = "PLZ") %>%
-  mutate(ga_percent = round((ga_total/pop_total)*100, 1),
-         ht_percent = round((ht_total/pop_total)*100, 1))
+  left_join(postcode_lookup, by = "PLZ") %>%
+  mutate(ga_percent = case_when(is.na(ga_imp_flag) ~ round((ga_total/pop_total)*100, 1)),
+         ht_percent = case_when(is.na(ht_imp_flag) ~ round((ht_total/pop_total)*100, 1)))
 
 swiss_2019 %>%
   arrange(desc(ga_percent))
 ```
 
-Plot:
+Get lakes:
+(source: https://www.worldwildlife.org/publications/global-lakes-and-wetlands-database-large-lake-polygons-level-1)
 
 ```{r}
-summary(swiss_2019$ga_percent)
+swiss_outline <- simp_swiss %>%
+  summarise(country = "SWITZERLAND")
+
+setwd("C:/Users/brown/Desktop/swiss_data_maps")
+dir <- "spatial/lakes/"
+file <- "glwd_1.shp"
+lakes_1 <- st_read(paste0(dir, file)) %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = 21781) %>%
+  st_filter(swiss_outline, .predicate = st_intersects) %>%
+  select()
+
+file <- "glwd_2.shp"
+lakes_2 <- st_read(paste0(dir, file)) %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = 21781) %>%
+  st_filter(swiss_outline, .predicate = st_intersects) %>%
+  select()
+
+swiss_lakes <- bind_rows(lakes_1, lakes_2) %>%
+  st_intersection(swiss_outline)
+
+tm_shape(simp_swiss) +
+  tm_polygons() +
+tm_shape(swiss_lakes) +
+  tm_polygons(col = "lightblue")
+```
+
+Get just Zurich:
+
+```{r}
+swiss_2019 %>%
+  filter(str_detect(kanton, "Zürich"))
+```
+
+
+
+Plot:
+
+```{r fig.width=15, fig.height=12}
+# summary(swiss_2019$ga_percent)
 
 vars <- seq(0, 11, by = 1) %>%
   as_tibble() %>%
@@ -127,42 +202,69 @@ labels <- vars[1:11,] %>% pull(label)
 
 cities <- world.cities %>%
   filter(country.etc == "Switzerland",
-         pop > 100000) %>%
+         pop > 30000,
+         !name %in% c("Koniz", "Vernier") ) %>%
   st_as_sf(coords = c("long", "lat"),
            crs = 4326) %>%
   st_transform(crs = st_crs(21781))
 
-tm_shape(cities) +
-  tm_text(text = "name")
+credits <- "For adults, GA costs 3,612 EUR per year\n
+            Postcode area is spatial unit\n
+            Data all open:\n
+            Rail pass ownership and boundaries from\n
+            Swiss Federal Statistical Office (2020)\n
+            Cities from maps()\n
+            Rail lines from Swiss Federal Office of Transport\n
+            Built using tmap() and sf()\n
+            Author: Christopher C Brown (2020)"
 
 tmap_mode("plot")
-map <- tm_shape(swiss_2019) +
-  tm_fill(col = "ga_percent",
-              palette = "Reds",
-              labels = labels,
-              breaks = breaks,
-              title = "Percent of population") +
-tm_shape(swiss_network) +
-  tm_lines(col = "grey90",
+map <- 
+  tm_shape(swiss_2019) +
+   tm_fill(col     = "ga_percent",
+           palette = "Reds",
+           labels  = labels,
+           breaks  = breaks,
+           title   = "Percent of population") +
+  tm_shape(rail_simp) +
+   tm_lines(col  = "grey90",
            alpha = 0.5,
-           lwd = 2) +
-tm_shape(cities) +
-  tm_text(text = "name",
-          bg.color = "grey60",
-          bg.alpha = 0.2) +
-          tm_credits("For adults, GA costs 3,612 EUR per year\nPostcode area is spatial unit\nData all open:\nRail pass ownership and boundaries from\nSwiss Federal Statistical Office (2020)\nCities from maps()\nRail lines from Swiss Federal Office of Transport\nBuilt using tmap() and sf()\nAuthor: Christopher C Brown (2020)",
-           align = "right",
+           lwd   = 2) +
+  tm_shape(swiss_lakes) +
+   tm_fill(col = "lightblue") +
+  tm_shape(cities) +
+   tm_text(text     = "name",
+           bg.color = "grey60",
+           bg.alpha = 0.2) +
+  tm_credits(credits,
+           align    = "right",
            bg.color = "grey60",
            bg.alpha = 0.5,
            position = c("right", "top")) +
-tm_layout(frame = FALSE,
+  tm_layout(frame    = FALSE,
           main.title = "Unlimited rail pass ('GA') ownership in Switzerland")
 
 map
 
-tmap_save(map,
-          filename = "map.png",
-          width = 3300,
-          height = 3000,
-          units = "px")
+# tmap_save(map,
+#          filename = "map.png",
+#          width = 3300,
+#          height = 3000,
+#          units = "px")
 ```
+
+
+```{r}
+lakes <- map_data('lakes') %>%
+  st_as_sf(coords = c("long", "lat")) %>%
+  st_cast("POLYGON")
+
+
+
+
+
+map('world')
+map('lakes', add=TRUE, fill=TRUE, col='blue', boundary='black') %>%
+  st_as_sf()
+```
+
